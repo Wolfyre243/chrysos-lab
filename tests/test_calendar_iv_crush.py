@@ -18,7 +18,7 @@ from calculators.calendar_iv_crush import (
 from cli.calendar_iv_crush import format_result
 from errors import CalculatorError
 
-from conftest import AS_OF, SPOT, make_chain, make_history
+from conftest import AS_OF, SPOT, FakeProvider, make_chain, make_history
 
 
 def _inputs(chains, history, spot=SPOT):
@@ -172,27 +172,6 @@ def test_short_history_raises(chains):
 
 
 # --- run() with a fake provider ---------------------------------------------
-
-
-class FakeProvider:
-    def __init__(self, chains, history, spot=SPOT):
-        self._chains = {c.expiry: c for c in chains}
-        self._history = history
-        self._spot = spot
-        self.fetched: list = []
-
-    def expirations(self, symbol):
-        return list(self._chains)
-
-    def option_chain(self, symbol, expiry):
-        self.fetched.append(expiry)
-        return self._chains[expiry]
-
-    def spot(self, symbol):
-        return self._spot
-
-    def price_history(self, symbol, period="3mo"):
-        return self._history
 
 
 def test_run_fetches_only_selected_expiries(chains, history):

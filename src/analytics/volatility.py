@@ -36,6 +36,19 @@ def yang_zhang(prices: pd.DataFrame, window: int = 30, trading_periods: int = 25
     return result.dropna()
 
 
+def total_variance(iv: float, t: float) -> float:
+    """Variance accumulated to time ``t`` (years) at annualised vol ``iv``."""
+    return iv**2 * t
+
+
+def forward_variance(iv1: float, t1: float, iv2: float, t2: float) -> float:
+    """Annualised variance implied between ``t1`` and ``t2`` (years, ``t2 > t1``).
+
+    Negative when the two vols are inconsistent with any real forward vol.
+    """
+    return (total_variance(iv2, t2) - total_variance(iv1, t1)) / (t2 - t1)
+
+
 def term_structure(dtes: Sequence[float], ivs: Sequence[float]) -> Callable[[float], float]:
     """Linear IV-vs-DTE curve, held flat beyond the first and last points."""
     dtes_arr = np.asarray(dtes, dtype=float)

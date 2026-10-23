@@ -6,11 +6,15 @@ Chrysos ChainSnapshot) needs no calculator changes.
 
 from dataclasses import dataclass
 from datetime import date
+from typing import Literal
 
 import pandas as pd
 
 # Columns every provider must supply for each side of an option chain.
 CHAIN_COLUMNS = ("strike", "iv", "bid", "ask")
+
+OptionSide = Literal["call", "put"]
+SIDES: tuple[OptionSide, ...] = ("call", "put")
 
 # Columns every provider must supply for daily price history (matches the PriceBar entity).
 PRICE_COLUMNS = ("open", "high", "low", "close", "volume")
@@ -23,3 +27,6 @@ class OptionChain:
     expiry: date
     calls: pd.DataFrame
     puts: pd.DataFrame
+
+    def side(self, side: OptionSide) -> pd.DataFrame:
+        return self.calls if side == "call" else self.puts

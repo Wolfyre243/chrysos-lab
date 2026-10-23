@@ -1,3 +1,3 @@
-from analytics.volatility import term_structure, yang_zhang
+from analytics.volatility import forward_variance, term_structure, total_variance, yang_zhang
 
-__all__ = ["term_structure", "yang_zhang"]
+__all__ = ["forward_variance", "term_structure", "total_variance", "yang_zhang"]

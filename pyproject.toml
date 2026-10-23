@@ -12,6 +12,7 @@ dependencies = [
 
 [project.scripts]
 calendar-iv-crush = "cli.calendar_iv_crush:main"
+forward-factor = "cli.forward_factor:main"
 
 [dependency-groups]
 dev = ["pytest>=8"]

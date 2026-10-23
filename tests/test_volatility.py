@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from analytics.volatility import term_structure, yang_zhang
+from analytics.volatility import forward_variance, term_structure, total_variance, yang_zhang
 
 from conftest import make_history
 
@@ -52,3 +52,13 @@ def test_term_structure_interpolates_and_clamps():
 def test_term_structure_accepts_pandas():
     curve = term_structure(pd.Series([10, 20]), pd.Series([0.5, 0.3]))
     assert curve(15) == pytest.approx(0.4)
+
+
+def test_total_variance():
+    assert total_variance(0.30, 0.5) == pytest.approx(0.045)
+
+
+def test_forward_variance():
+    assert forward_variance(0.40, 30 / 365, 0.30, 60 / 365) == pytest.approx(0.02)
+    assert forward_variance(0.30, 0.1, 0.30, 0.2) == pytest.approx(0.09)  # flat curve
+    assert forward_variance(0.60, 30 / 365, 0.30, 60 / 365) < 0

@@ -16,16 +16,18 @@ the function to call from other code; ``run`` fetches data through a
 MarketDataProvider and then calls ``evaluate``.
 """
 
-import math
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from typing import Any, Literal
+from typing import Literal
 
 import pandas as pd
 
+from analytics.chain import is_stale, mean_iv, nearest_quote, stale_error
 from analytics.volatility import term_structure, yang_zhang
+from calculators.results import Check, Serializable, at_least, at_most
 from calculators.spec import CalculatorSpec
+from data.fetch import market_date, require_expirations, require_spot, resolve
 from data.models import OptionChain
 from data.provider import MarketDataProvider
 from errors import CalculatorError
@@ -39,9 +41,6 @@ SPEC = CalculatorSpec(
 )
 
 Recommendation = Literal["Recommended", "Consider", "Avoid"]
-
-# Yahoo reports IV as 0.00001 when it has no live quotes; no real ATM option trades this low.
-STALE_IV_FLOOR = 1e-4
 
 
 @dataclass(frozen=True)
@@ -68,14 +67,6 @@ class Inputs:
 
 
 @dataclass(frozen=True)
-class Check:
-    value: float
-    threshold: float
-    op: Literal[">=", "<="]
-    passed: bool
-
-
-@dataclass(frozen=True)
 class TermPoint:
     expiry: date
     dte: int
@@ -83,7 +74,7 @@ class TermPoint:
 
 
 @dataclass(frozen=True)
-class Result:
+class Result(Serializable):
     symbol: str
     as_of: date
     spot: float
@@ -98,10 +89,6 @@ class Result:
     expected_move: float | None  # straddle / spot, as a fraction
     term_structure: list[TermPoint] = field(default_factory=list)
     calculator_version: int = SPEC.version
-
-    def to_dict(self) -> dict[str, Any]:
-        """JSON-friendly representation (dates as ISO strings)."""
-        return _jsonable(self)
 
 
 def select_expiries(expiries: Iterable[date], as_of: date, max_dte: int = 45) -> list[date]:
@@ -130,15 +117,11 @@ def evaluate(inputs: Inputs, params: Params = Params()) -> Result:
         if calls.empty or puts.empty:
             continue
 
-        call = calls.loc[(calls["strike"] - inputs.spot).abs().idxmin()]
-        put = puts.loc[(puts["strike"] - inputs.spot).abs().idxmin()]
-        if _is_stale(call) or _is_stale(put):
-            raise CalculatorError(
-                f"Stale option quotes for {chain.expiry.isoformat()}: ATM bid/ask are zero or IV is at "
-                "the provider's floor. Yahoo clears option quotes overnight; try again after the market opens."
-            )
-        atm_iv = (float(call["iv"]) + float(put["iv"])) / 2.0
-        points.append(TermPoint(chain.expiry, (chain.expiry - inputs.as_of).days, atm_iv))
+        call = nearest_quote(calls, inputs.spot)
+        put = nearest_quote(puts, inputs.spot)
+        if is_stale(call) or is_stale(put):
+            raise stale_error(chain.expiry.isoformat())
+        points.append(TermPoint(chain.expiry, (chain.expiry - inputs.as_of).days, mean_iv(call, put)))
 
         if len(points) == 1:
             straddle = _straddle(call, put)
@@ -165,9 +148,9 @@ def evaluate(inputs: Inputs, params: Params = Params()) -> Result:
     rv30 = float(rv_series.iloc[-1])
     avg_volume = float(volume_series.iloc[-1])
 
-    avg_volume_check = _at_least(avg_volume, params.min_avg_volume)
-    iv30_rv30_check = _at_least(iv30 / rv30, params.min_iv30_rv30)
-    ts_slope_check = _at_most(ts_slope, params.max_ts_slope_0_45)
+    avg_volume_check = at_least(avg_volume, params.min_avg_volume)
+    iv30_rv30_check = at_least(iv30 / rv30, params.min_iv30_rv30)
+    ts_slope_check = at_most(ts_slope, params.max_ts_slope_0_45)
 
     return Result(
         symbol=inputs.symbol,
@@ -192,33 +175,19 @@ def run(
     params: Params = Params(),
     as_of: date | None = None,
 ) -> Result:
-    """Fetch data for ``symbol`` through ``provider`` (default: yfinance) and evaluate it."""
-    symbol = symbol.strip().upper()
-    if not symbol:
-        raise CalculatorError("No stock symbol provided.")
-    if provider is None:
-        from data.yfinance_provider import YFinanceProvider
+    """Fetch data for ``symbol`` through ``provider`` (default: yfinance) and evaluate it.
 
-        provider = YFinanceProvider()
-    as_of = as_of or date.today()
+    ``as_of`` defaults to today's US market date.
+    """
+    symbol, provider = resolve(symbol, provider)
+    as_of = as_of or market_date()
 
-    expiries = provider.expirations(symbol)
-    if not expiries:
-        raise CalculatorError(f"No options found for stock symbol '{symbol}'.")
-    selected = select_expiries(expiries, as_of, params.max_dte)
+    selected = select_expiries(require_expirations(provider, symbol), as_of, params.max_dte)
     chains = [provider.option_chain(symbol, expiry) for expiry in selected]
-
-    spot = provider.spot(symbol)
-    if spot is None:
-        raise CalculatorError("Unable to retrieve underlying stock price.")
+    spot = require_spot(provider, symbol)
 
     history = provider.price_history(symbol, params.history_period)
     return evaluate(Inputs(symbol, as_of, spot, chains, history), params)
-
-
-def _is_stale(quote: pd.Series) -> bool:
-    """True when a quote has been cleared: both bid and ask zero, or IV at the floor."""
-    return (quote["bid"] == 0 and quote["ask"] == 0) or float(quote["iv"]) <= STALE_IV_FLOOR
 
 
 def _straddle(call: pd.Series, put: pd.Series) -> float | None:
@@ -231,29 +200,9 @@ def _straddle(call: pd.Series, put: pd.Series) -> float | None:
     return (call_mid + put_mid) or None
 
 
-def _at_least(value: float, threshold: float) -> Check:
-    return Check(value, threshold, ">=", value >= threshold)
-
-
-def _at_most(value: float, threshold: float) -> Check:
-    return Check(value, threshold, "<=", value <= threshold)
-
-
 def _recommend(avg_volume: bool, iv30_rv30: bool, ts_slope_0_45: bool) -> Recommendation:
     if avg_volume and iv30_rv30 and ts_slope_0_45:
         return "Recommended"
     if ts_slope_0_45 and avg_volume != iv30_rv30:
         return "Consider"
     return "Avoid"
-
-
-def _jsonable(obj: Any) -> Any:
-    if hasattr(obj, "__dataclass_fields__"):
-        return {name: _jsonable(getattr(obj, name)) for name in obj.__dataclass_fields__}
-    if isinstance(obj, list):
-        return [_jsonable(item) for item in obj]
-    if isinstance(obj, date):
-        return obj.isoformat()
-    if isinstance(obj, float) and math.isnan(obj):
-        return None
-    return obj

@@ -36,6 +36,29 @@ def make_history(days: int = 63, volume: float = 2_000_000, seed: int = 7) -> pd
     )
 
 
+class FakeProvider:
+    """MarketDataProvider over in-memory chains; records which expiries were fetched."""
+
+    def __init__(self, chains, history=None, spot=SPOT):
+        self._chains = {c.expiry: c for c in chains}
+        self._history = history
+        self._spot = spot
+        self.fetched: list = []
+
+    def expirations(self, symbol):
+        return list(self._chains)
+
+    def option_chain(self, symbol, expiry):
+        self.fetched.append(expiry)
+        return self._chains[expiry]
+
+    def spot(self, symbol):
+        return self._spot
+
+    def price_history(self, symbol, period="3mo"):
+        return self._history
+
+
 @pytest.fixture
 def chains() -> list[OptionChain]:
     """Expiries at 0 (dropped), 4, 11, 25, 46 and 60 (beyond the cut) DTE; downward-sloping IV."""
