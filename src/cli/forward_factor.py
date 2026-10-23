@@ -4,6 +4,7 @@
     uv run forward-factor                           # prompt for symbols until blank / exit
     uv run forward-factor AAPL --json               # structured output
     uv run forward-factor AAPL --strikes 7 --top 15
+    uv run forward-factor AAPL --max-spread 5       # stricter bid-ask limit (% of mid)
 """
 
 import argparse
@@ -12,23 +13,36 @@ import sys
 from calculators.forward_factor import Result
 from cli.shell import CHECK_HEADERS, base_parser, check_row, format_table, report, run_symbols
 from data.yfinance_provider import YFinanceProvider
-from data.models import SIDES, OptionSide
-from scanners.forward_factor import Candidate, Params, ScanResult, run, window_label
+from scanners.forward_factor import STRUCTURES, Candidate, Params, ScanResult, Structure, run, window_label
 
 DETAIL = 3  # candidates given a full breakdown
 
-_SIDE_HEADERS = ("Side", "Trades", "Pass", "Best FF", "Best trade")
-_RANK_HEADERS = ("Rank", "Side", "Front", "DTE", "Back", "DTE", "Strike", "IV1", "IV2", "Fwd vol", "FF", "Result")
+_LABELS: dict[Structure, str] = {"call": "call", "put": "put", "double_35d": "dbl 35d"}
+_NAMES: dict[Structure, str] = {
+    "call": "call calendar",
+    "put": "put calendar",
+    "double_35d": "35-delta double calendar",
+}
+
+_TYPE_HEADERS = ("Type", "Trades", "Pass", "Best FF", "Best trade")
+_RANK_HEADERS = ("Rank", "Type", "Front", "DTE", "Back", "DTE", "Strike", "IV1", "IV2", "FF", "Spread", "Close by", "Result")
 
 
 def format_scan(scan: ScanResult, top: int = 10) -> str:
-    passing = sum(1 for c in scan.candidates if _passed(c))
+    passing = sum(1 for c in scan.candidates if c.passed)
+    earnings = (
+        f"Next earnings {scan.earnings.isoformat()}: trades whose back expiry is on/after it fail."
+        if scan.earnings
+        else "Next earnings: none found."
+    )
     lines = [
         scan.symbol,
-        f"{passing} of {len(scan.candidates)} trades pass FF >= {scan.min_ff:g}",
+        f"{passing} of {len(scan.candidates)} trades pass: FF >= {scan.min_ff:g}, no earnings "
+        f"before the back expiry, every leg's bid-ask <= {scan.max_spread * 100:g}% of mid",
         "",
         f"Spot {scan.spot:,.2f}  |  DTE windows: front {window_label(scan.front_window)}, "
         f"back {window_label(scan.back_window)}  |  As of {scan.as_of.isoformat()}",
+        earnings,
     ]
     if scan.widened:
         lines.append("Windows widened: no listed expiries fit the default ones.")
@@ -36,19 +50,38 @@ def format_scan(scan: ScanResult, top: int = 10) -> str:
         lines.append(f"{scan.skipped_stale} trades skipped for stale quotes.")
 
     lines.append("")
-    lines.extend(format_table(_SIDE_HEADERS, [_side_row(scan, side) for side in SIDES]))
+    lines.extend(format_table(_TYPE_HEADERS, [_type_row(scan, s) for s in STRUCTURES]))
 
     ranked = scan.candidates[:top]
     lines.append("")
     lines.extend(format_table(_RANK_HEADERS, [_rank_row(i, c) for i, c in enumerate(ranked, 1)]))
 
     for i, candidate in enumerate(ranked[:DETAIL], 1):
-        lines += ["", f"#{i}  {candidate.side} calendar  {_trade(candidate)}", format_breakdown(candidate.result)]
+        lines += ["", f"#{i}  {_describe(candidate)}", format_candidate(candidate, scan)]
     return "\n".join(lines)
+
+
+def format_candidate(c: Candidate, scan: ScanResult) -> str:
+    """Forward vol working plus the spread and earnings checks for one trade."""
+    earnings = (
+        "FAIL" if c.crosses_earnings else "PASS",
+        "none found" if scan.earnings is None else scan.earnings.isoformat(),
+        f"> {c.back_expiry.isoformat()}",
+    )
+    rows = [
+        *_breakdown_rows(c.result),
+        check_row("max leg spread", c.spread, "{:.1%}"),
+        ("earnings", *earnings),
+    ]
+    return "\n".join(format_table(CHECK_HEADERS, rows))
 
 
 def format_breakdown(result: Result) -> str:
     """The forward vol working for one pair, as in the original calculator."""
+    return "\n".join(format_table(CHECK_HEADERS, _breakdown_rows(result)))
+
+
+def _breakdown_rows(result: Result) -> list[tuple[str, str, str, str]]:
     fwd_var = f"{result.fwd_var:.8f}"
     if result.fwd_vol is None:
         fwd_var += " (negative)"
@@ -70,17 +103,17 @@ def format_breakdown(result: Result) -> str:
         rows.append(("ff", "FAIL", f"undefined ({ff_note})", ""))
     else:
         rows += [check_row("ff", result.ff, "{:.4f}"), ("ff (%)", "", f"{result.ff.value:.2%}", "")]
-    return "\n".join(format_table(CHECK_HEADERS, rows))
+    return rows
 
 
-def _side_row(scan: ScanResult, side: OptionSide) -> tuple[str, ...]:
-    """Trade count, passes and best trade for one side (candidates are already ranked)."""
-    trades = [c for c in scan.candidates if c.side == side]
+def _type_row(scan: ScanResult, structure: Structure) -> tuple[str, ...]:
+    """Trade count, passes and best trade for one structure (candidates are already ranked)."""
+    trades = [c for c in scan.candidates if c.structure == structure]
     best = trades[0] if trades else None
     return (
-        side,
+        _LABELS[structure],
         str(len(trades)),
-        str(sum(1 for c in trades if _passed(c))),
+        str(sum(1 for c in trades if c.passed)),
         "n/a" if best is None or best.result.ff is None else f"{best.result.ff.value:.3f}",
         "" if best is None else _trade(best),
     )
@@ -90,29 +123,35 @@ def _rank_row(rank: int, c: Candidate) -> tuple[str, ...]:
     r = c.result
     return (
         str(rank),
-        c.side,
+        "call ATM" if c.atm else _LABELS[c.structure],
         c.front_expiry.isoformat(),
         str(c.front_dte),
         c.back_expiry.isoformat(),
         str(c.back_dte),
-        f"{c.strike:,.2f}",
+        _strikes(c),
         f"{r.iv1:.2%}",
         f"{r.iv2:.2%}",
-        "n/a" if r.fwd_vol is None else f"{r.fwd_vol:.2%}",
         "n/a" if r.ff is None else f"{r.ff.value:.3f}",
-        "PASS" if _passed(c) else "FAIL",
+        f"{c.spread.value:.1%}",
+        c.close_by.isoformat(),
+        "PASS" if c.passed else f"FAIL {','.join(c.flags)}",
     )
 
 
-def _passed(c: Candidate) -> bool:
-    return c.result.ff is not None and c.result.ff.passed
+def _describe(c: Candidate) -> str:
+    name = _NAMES[c.structure] + (" (ATM)" if c.atm else "")
+    return f"{name}  {_trade(c)}  |  close by {c.close_by.isoformat()}"
 
 
 def _trade(c: Candidate) -> str:
     return (
         f"{c.front_expiry.isoformat()} ({c.front_dte}d) / {c.back_expiry.isoformat()} ({c.back_dte}d) "
-        f"@ {c.strike:,.2f}"
+        f"@ {_strikes(c)}"
     )
+
+
+def _strikes(c: Candidate) -> str:
+    return "/".join(f"{k:,.2f}" for k in c.strikes)
 
 
 def _positive_int(text: str) -> int:
@@ -122,21 +161,34 @@ def _positive_int(text: str) -> int:
     return value
 
 
+def _positive_float(text: str) -> float:
+    value = float(text)
+    if value <= 0:
+        raise argparse.ArgumentTypeError("must be above 0")
+    return value
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = base_parser("Forward factor scanner: ranks calendar pairs near 30/60 DTE.")
+    parser = base_parser("Forward factor scanner: ranks calendar trades near 30/60 DTE.")
     parser.add_argument(
         "--strikes",
         type=_positive_int,
         default=Params.strikes,
-        help="Strikes nearest spot checked per expiry pair (default %(default)s).",
+        help="Strikes nearest spot checked per expiry pair and side (default %(default)s).",
     )
     parser.add_argument(
         "--top", type=_positive_int, default=10, help="Ranked trades to list (default %(default)s)."
     )
+    parser.add_argument(
+        "--max-spread",
+        type=_positive_float,
+        default=Params.max_spread * 100,
+        help="Widest bid-ask allowed on any leg, as %% of mid (default %(default)g).",
+    )
     args = parser.parse_args(argv)
 
     provider = YFinanceProvider()
-    params = Params(strikes=args.strikes)
+    params = Params(strikes=args.strikes, max_spread=args.max_spread / 100)
 
     def handle(symbol: str) -> bool:
         return report(

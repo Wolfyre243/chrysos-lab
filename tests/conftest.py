@@ -39,10 +39,11 @@ def make_history(days: int = 63, volume: float = 2_000_000, seed: int = 7) -> pd
 class FakeProvider:
     """MarketDataProvider over in-memory chains; records which expiries were fetched."""
 
-    def __init__(self, chains, history=None, spot=SPOT):
+    def __init__(self, chains, history=None, spot=SPOT, earnings=None):
         self._chains = {c.expiry: c for c in chains}
         self._history = history
         self._spot = spot
+        self._earnings = earnings
         self.fetched: list = []
 
     def expirations(self, symbol):
@@ -57,6 +58,9 @@ class FakeProvider:
 
     def price_history(self, symbol, period="3mo"):
         return self._history
+
+    def next_earnings(self, symbol, after):
+        return self._earnings if self._earnings and self._earnings >= after else None
 
 
 @pytest.fixture

@@ -3,7 +3,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from data.fetch import market_date
+from data.market_calendar import market_date, previous_trading_day
 
 
 @pytest.mark.parametrize(
@@ -22,3 +22,15 @@ def test_market_date_uses_new_york_calendar(now, expected):
 
 def test_market_date_defaults_to_now():
     assert market_date() == datetime.now(ZoneInfo("America/New_York")).date()
+
+
+@pytest.mark.parametrize(
+    "day, expected",
+    [
+        (date(2026, 11, 20), date(2026, 11, 19)),  # Friday expiry -> Thursday
+        (date(2026, 11, 16), date(2026, 11, 13)),  # Monday -> previous Friday
+        (date(2026, 11, 15), date(2026, 11, 13)),  # Sunday -> Friday
+    ],
+)
+def test_previous_trading_day_skips_weekends(day, expected):
+    assert previous_trading_day(day) == expected

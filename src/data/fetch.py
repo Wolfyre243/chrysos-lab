@@ -1,20 +1,9 @@
 """Validated fetch steps shared by calculators and scanners that pull their own data."""
 
-from datetime import date, datetime
-from zoneinfo import ZoneInfo
+from datetime import date
 
 from data.provider import MarketDataProvider
 from errors import CalculatorError
-
-MARKET_TZ = ZoneInfo("America/New_York")
-
-
-def market_date(now: datetime | None = None) -> date:
-    """Today's date on US exchanges, whatever the local time zone. DTEs count from here.
-
-    ``now`` must be timezone-aware; it defaults to the current time.
-    """
-    return (now or datetime.now(MARKET_TZ)).astimezone(MARKET_TZ).date()
 
 
 def resolve(symbol: str, provider: MarketDataProvider | None) -> tuple[str, MarketDataProvider]:

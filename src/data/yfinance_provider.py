@@ -1,3 +1,4 @@
+import logging
 from datetime import date, datetime
 
 import pandas as pd
@@ -44,6 +45,20 @@ class YFinanceProvider:
         history = self._ticker(symbol).history(period=period)
         history = history.rename(columns=str.lower)
         return history[list(PRICE_COLUMNS)]
+
+    def next_earnings(self, symbol: str, after: date) -> date | None:
+        # Yahoo has no calendar for ETFs and indices; yfinance logs that 404 as an error.
+        logger = logging.getLogger("yfinance")
+        level = logger.level
+        logger.setLevel(logging.CRITICAL)
+        try:
+            dates = self._ticker(symbol).calendar.get("Earnings Date") or []
+        except Exception:
+            return None
+        finally:
+            logger.setLevel(level)
+        days = [d.date() if isinstance(d, datetime) else d for d in dates if isinstance(d, date)]
+        return min((d for d in days if d >= after), default=None)
 
 
 def _normalise_chain(frame: pd.DataFrame) -> pd.DataFrame:

@@ -23,11 +23,12 @@ from typing import Literal
 
 import pandas as pd
 
-from analytics.chain import is_stale, mean_iv, nearest_quote, stale_error
+from analytics.chain import is_stale, mean_iv, mid, nearest_quote, stale_error
 from analytics.volatility import term_structure, yang_zhang
 from calculators.results import Check, Serializable, at_least, at_most
 from calculators.spec import CalculatorSpec
-from data.fetch import market_date, require_expirations, require_spot, resolve
+from data.fetch import require_expirations, require_spot, resolve
+from data.market_calendar import market_date
 from data.models import OptionChain
 from data.provider import MarketDataProvider
 from errors import CalculatorError
@@ -195,9 +196,7 @@ def _straddle(call: pd.Series, put: pd.Series) -> float | None:
     quotes = [call["bid"], call["ask"], put["bid"], put["ask"]]
     if any(q is None or pd.isna(q) for q in quotes):
         return None
-    call_mid = (float(call["bid"]) + float(call["ask"])) / 2.0
-    put_mid = (float(put["bid"]) + float(put["ask"])) / 2.0
-    return (call_mid + put_mid) or None
+    return (mid(call) + mid(put)) or None
 
 
 def _recommend(avg_volume: bool, iv30_rv30: bool, ts_slope_0_45: bool) -> Recommendation:

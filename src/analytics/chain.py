@@ -1,9 +1,11 @@
 """Pure helpers for picking quotes out of option chains. No data fetching here."""
 
-from collections.abc import Iterable
+import math
+from collections.abc import Collection, Iterable
 
 import pandas as pd
 
+from analytics.greeks import delta
 from data.models import SIDES, OptionChain, OptionSide
 from errors import CalculatorError
 
@@ -29,8 +31,38 @@ def stale_error(where: str) -> CalculatorError:
     )
 
 
-def mean_iv(call: pd.Series, put: pd.Series) -> float:
-    return (float(call["iv"]) + float(put["iv"])) / 2.0
+def mean_iv(*quotes: pd.Series) -> float:
+    return sum(float(q["iv"]) for q in quotes) / len(quotes)
+
+
+def mid(quote: pd.Series) -> float:
+    return (float(quote["bid"]) + float(quote["ask"])) / 2.0
+
+
+def spread_pct(quote: pd.Series) -> float:
+    """Bid-ask spread as a fraction of mid; inf when there is no positive mid."""
+    m = mid(quote)
+    return (float(quote["ask"]) - float(quote["bid"])) / m if m > 0 else math.inf
+
+
+def quote_at_delta(
+    side_frame: pd.DataFrame,
+    side: OptionSide,
+    spot: float,
+    t: float,
+    target: float,
+    strikes: Collection[float],
+    rate: float = 0.0,
+) -> pd.Series | None:
+    """The row, among ``strikes``, whose delta is closest to ``target`` (e.g. 0.35 or -0.35)."""
+    rows = side_frame[side_frame["strike"].isin(strikes)]
+    deltas = pd.Series(
+        [delta(side, spot, float(k), float(iv), t, rate) for k, iv in zip(rows["strike"], rows["iv"])],
+        index=rows.index,
+    ).dropna()
+    if deltas.empty:
+        return None
+    return rows.loc[(deltas - target).abs().idxmin()]
 
 
 def common_strikes(

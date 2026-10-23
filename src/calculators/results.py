@@ -37,6 +37,6 @@ def jsonable(obj: Any) -> Any:
         return [jsonable(item) for item in obj]
     if isinstance(obj, date):
         return obj.isoformat()
-    if isinstance(obj, float) and math.isnan(obj):
+    if isinstance(obj, float) and not math.isfinite(obj):  # NaN / inf are not valid JSON
         return None
     return obj

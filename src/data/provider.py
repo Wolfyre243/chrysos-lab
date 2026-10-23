@@ -22,3 +22,7 @@ class MarketDataProvider(Protocol):
     def price_history(self, symbol: str, period: str = "3mo") -> pd.DataFrame:
         """Daily bars indexed by date, with PRICE_COLUMNS."""
         ...
+
+    def next_earnings(self, symbol: str, after: date) -> date | None:
+        """First scheduled earnings date on or after ``after``, or None if unknown or none (ETFs)."""
+        ...
