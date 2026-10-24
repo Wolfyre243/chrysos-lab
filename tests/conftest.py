@@ -10,14 +10,19 @@ AS_OF = date(2026, 10, 20)
 SPOT = 100.0
 
 
-def make_chain(expiry: date, atm_iv: float, bid: float = 2.0, ask: float = 2.2) -> OptionChain:
-    """Three strikes around SPOT; the ATM strike (100) carries ``atm_iv`` and the given quotes."""
+def make_chain(
+    expiry: date, atm_iv: float, bid: float = 2.0, ask: float = 2.2, volume: float = 1_500
+) -> OptionChain:
+    """Three strikes around SPOT; the ATM strike (100) carries ``atm_iv``, the given quotes and
+    ``volume``. The 110 strike is thin (50 traded today), 90 and 110 have OI under 5,000."""
     side = pd.DataFrame(
         {
             "strike": [90.0, 100.0, 110.0],
             "iv": [atm_iv + 0.1, atm_iv, atm_iv + 0.1],
             "bid": [10.0, bid, 0.5],
             "ask": [10.5, ask, 0.6],
+            "volume": [800.0, volume, 50.0],
+            "open_interest": [4_000.0, 20_000.0, 3_000.0],
         }
     )
     return OptionChain(expiry=expiry, calls=side.copy(), puts=side.copy())

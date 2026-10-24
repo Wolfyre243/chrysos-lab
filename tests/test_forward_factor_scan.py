@@ -4,9 +4,9 @@ from datetime import date, timedelta
 import pandas as pd
 import pytest
 
-from analytics.chain import common_strikes
+from analytics.chain import strikes_around
 from calculators import forward_factor
-from cli.forward_factor import format_scan
+from cli.forward_factor import format_scan, main
 from data.market_calendar import previous_trading_day
 from data.models import OptionChain
 from errors import CalculatorError
@@ -14,8 +14,8 @@ from scanners.forward_factor import Inputs, Params, pick_legs, run, scan
 
 from conftest import AS_OF, SPOT, FakeProvider, make_chain
 
-# make_chain quotes: strike 90 spread 4.9% of mid, 100 (ATM) 9.5%, 110 18.2%. With the
-# default 10% cap, trades using the 110 strike fail on spread. The 35-delta double
+# make_chain liquidity: strike 110 trades only 50 contracts, so with the default 100-contract
+# minimum every trade using it fails on volume. The 35-delta double
 # calendar lands on the 100 put and the 110 call.
 DOUBLE_STRIKES = (100.0, 110.0)
 
@@ -40,7 +40,7 @@ def _scan(chains, params=Params(), earnings=None):
 
 
 def _blocked(c):
-    return "earnings" in c.flags or "spread" in c.flags
+    return bool(set(c.flags) - {"ff"})
 
 
 # --- leg selection ---------------------------------------------------------
@@ -80,18 +80,47 @@ def test_pick_legs_raises_when_nothing_fits():
 def _chain(dte, call_strikes, put_strikes, iv=0.3):
     def side(strikes):
         n = len(strikes)
-        return pd.DataFrame({"strike": strikes, "iv": [iv] * n, "bid": [1.0] * n, "ask": [1.1] * n})
+        return pd.DataFrame(
+            {
+                "strike": strikes,
+                "iv": [iv] * n,
+                "bid": [1.0] * n,
+                "ask": [1.1] * n,
+                "volume": [500.0] * n,
+                "open_interest": [5_000.0] * n,
+            }
+        )
 
     return OptionChain(AS_OF + timedelta(days=dte), side(call_strikes), side(put_strikes))
 
 
-def test_common_strikes_needs_every_given_side_of_every_chain():
+LADDER = [80.0, 90.0, 100.0, 110.0, 120.0]
+
+
+@pytest.mark.parametrize(
+    "target, width, expected",
+    [
+        (100.0, 1, [90.0, 100.0, 110.0]),  # center +/- 1
+        (100.0, 2, LADDER),
+        (100.0, 0, [100.0]),
+        (82.0, 1, [80.0, 90.0]),  # clamped at the bottom
+        (500.0, 1, [110.0, 120.0]),  # clamped at the top; far target snaps to the last strike
+        (108.0, 0, [110.0]),  # unlisted target snaps to the nearest
+        (105.0, 0, [100.0]),  # tie goes to the lower strike
+    ],
+)
+def test_strikes_around(target, width, expected):
+    chains = [_chain(30, LADDER, LADDER), _chain(60, LADDER, LADDER)]
+    assert strikes_around(chains, target, width) == expected
+
+
+def test_strikes_around_needs_every_given_side_of_every_chain():
     front = _chain(30, [90.0, 100.0, 110.0], [90.0, 100.0])
     back = _chain(60, [100.0, 110.0, 120.0], [90.0, 100.0, 110.0, 120.0])
-    assert common_strikes([front, back], spot=104.0, n=5) == [100.0]
-    assert common_strikes([front, back], spot=104.0, n=5, sides=("call",)) == [100.0, 110.0]
-    assert common_strikes([front, back], spot=104.0, n=5, sides=("put",)) == [90.0, 100.0]
-    assert common_strikes([front, back], spot=104.0, n=1, sides=("call",)) == [100.0]
+    assert strikes_around([front, back], 104.0, 1) == [100.0]
+    assert strikes_around([front, back], 104.0, 1, sides=("call",)) == [100.0, 110.0]
+    assert strikes_around([front, back], 104.0, 1, sides=("put",)) == [90.0, 100.0]
+    assert strikes_around([_chain(30, [], [])], 104.0, 1) == []
 
 
 # --- scan ------------------------------------------------------------------
@@ -113,7 +142,7 @@ def test_scan_scores_every_structure_pair_and_strike(ff_chains):
     doubles = {("double_35d", f, 63, DOUBLE_STRIKES) for f in (28, 35)}
     assert _trades(result) == singles | doubles
     assert result.min_ff == 0.2
-    assert result.max_spread == 0.10
+    assert (result.min_volume, result.min_open_interest) == (100, 1_000)
     assert result.skipped_stale == 0
 
 
@@ -129,7 +158,7 @@ def test_scan_ranks_blocked_trades_last_then_by_ff(ff_chains):
 
 def test_scan_feeds_each_sides_iv_to_calculator(ff_chains):
     ff_chains[1] = _put_iv_shift(ff_chains[1], 0.02)  # 28 DTE puts at 42%, calls at 40%
-    result = _scan(ff_chains, Params(strikes=1))
+    result = _scan(ff_chains, Params(strike_range=0))
     by_side = {c.structure: c for c in result.candidates if c.front_dte == 28 and c.structure != "double_35d"}
 
     assert by_side["call"].strikes == by_side["put"].strikes == (100.0,)
@@ -148,7 +177,7 @@ def test_scan_double_calendar_averages_wing_ivs(ff_chains):
     assert double.result.fwd_var == pytest.approx(expected.fwd_var)
     assert double.result.ff.value == pytest.approx(expected.ff.value)
     assert not double.atm
-    assert "spread" in double.flags  # the 110 call legs are wide
+    assert "volume" in double.flags  # the 110 call legs are thin
 
 
 def test_scan_marks_one_atm_call_per_pair(ff_chains):
@@ -157,6 +186,43 @@ def test_scan_marks_one_atm_call_per_pair(ff_chains):
         (28, "call", (100.0,)),
         (35, "call", (100.0,)),
     ]
+
+
+def test_scan_given_strike_scans_only_that_strike(ff_chains):
+    result = _scan(ff_chains, Params(strike=110.0, strike_range=3))  # range is ignored
+    assert _trades(result) == {(s, f, 63, (110.0,)) for s in ("call", "put") for f in (28, 35)}
+    assert result.strike == 110.0
+    assert result.strike_range == 0
+
+
+def test_scan_given_strike_keeps_only_pairs_that_list_it():
+    ladder = [90.0, 100.0, 110.0]
+    chains = [
+        _chain(28, ladder + [105.0], ladder + [105.0]),
+        _chain(35, ladder, ladder),  # no 105
+        _chain(63, ladder + [105.0], ladder + [105.0]),
+    ]
+    result = _scan(chains, Params(strike=105.0))
+    assert _trades(result) == {("call", 28, 63, (105.0,)), ("put", 28, 63, (105.0,))}
+
+
+@pytest.mark.parametrize(
+    "strike, nearest",
+    [
+        (108.0, "100.00, 110.00"),
+        (200.0, "110.00"),
+        (50.0, "90.00"),
+    ],
+)
+def test_scan_given_unlisted_strike_raises_with_nearest(ff_chains, strike, nearest):
+    with pytest.raises(CalculatorError, match=f"lists the {strike:,.2f} strike.*Nearest strikes that do: {nearest}\\."):
+        _scan(ff_chains, Params(strike=strike))
+
+
+def test_scan_marks_atm_only_when_it_is_scanned(ff_chains):
+    assert not any(c.atm for c in _scan(ff_chains, Params(strike=90.0)).candidates)
+    atm = [c for c in _scan(ff_chains, Params(strike=100.0)).candidates if c.atm]
+    assert {(c.structure, c.strikes) for c in atm} == {("call", (100.0,))}
 
 
 def test_scan_close_by_is_weekday_before_front_expiry(ff_chains):
@@ -185,13 +251,26 @@ def test_scan_earnings_guard(ff_chains, earnings_dte, crosses):
     assert not any(c.passed for c in result.candidates) if crosses else any(c.passed for c in result.candidates)
 
 
-def test_scan_spread_check(ff_chains):
-    wide = [c for c in _scan(ff_chains).candidates if "spread" in c.flags]
-    assert {c.strikes for c in wide} == {(110.0,), DOUBLE_STRIKES}
-    assert all(c.spread.value == pytest.approx(0.1 / 0.55) for c in wide)
+def test_scan_volume_check_uses_thinnest_leg(ff_chains):
+    thin = [c for c in _scan(ff_chains).candidates if "volume" in c.flags]
+    assert {c.strikes for c in thin} == {(110.0,), DOUBLE_STRIKES}
+    assert all(c.volume.value == 50 and c.volume.threshold == 100 for c in thin)
 
-    loose = _scan(ff_chains, Params(max_spread=0.2))
-    assert not any("spread" in c.flags for c in loose.candidates)
+    assert not any("volume" in c.flags for c in _scan(ff_chains, Params(min_volume=50)).candidates)
+
+
+def test_scan_missing_volume_counts_as_zero(ff_chains):
+    ff_chains[1] = make_chain(AS_OF + timedelta(days=28), 0.40, volume=float("nan"))
+    atm = [c for c in _scan(ff_chains).candidates if c.front_dte == 28 and c.strikes == (100.0,)]
+    assert atm and all(c.volume.value == 0 and "volume" in c.flags for c in atm)
+
+
+def test_scan_open_interest_check_uses_thinnest_leg(ff_chains):
+    assert not any("oi" in c.flags for c in _scan(ff_chains).candidates)  # every leg has >= 3,000
+
+    strict = _scan(ff_chains, Params(min_open_interest=5_000)).candidates
+    assert {c.strikes for c in strict if "oi" in c.flags} == {(90.0,), (110.0,), DOUBLE_STRIKES}
+    assert {c.open_interest.value for c in strict if c.strikes == (90.0,)} == {4_000}
 
 
 def test_scan_puts_undefined_ff_last():
@@ -200,7 +279,7 @@ def test_scan_puts_undefined_ff_last():
         make_chain(AS_OF + timedelta(days=35), 0.35),
         make_chain(AS_OF + timedelta(days=63), 0.30),
     ]
-    result = _scan(chains, Params(strikes=1, max_spread=1.0))
+    result = _scan(chains, Params(strike_range=0, min_volume=0))
     assert [c.front_dte for c in result.candidates] == [35, 35, 35, 28, 28, 28]
     assert all(c.result.ff is None for c in result.candidates[3:])
 
@@ -220,7 +299,7 @@ def test_scan_raises_when_every_trade_is_stale():
         make_chain(AS_OF + timedelta(days=63), 0.30),
     ]
     with pytest.raises(CalculatorError, match="Stale option quotes"):
-        _scan(chains, Params(strikes=1))
+        _scan(chains, Params(strike_range=0))
 
 
 def test_scan_raises_without_shared_strikes():
@@ -260,8 +339,7 @@ def test_run_errors(ff_chains):
 
 
 def test_to_dict_is_strict_json(ff_chains):
-    stale_bid = make_chain(AS_OF + timedelta(days=35), 0.35, bid=0.0, ask=0.1)  # mid > 0
-    ff_chains[2] = stale_bid
+    ff_chains[2] = make_chain(AS_OF + timedelta(days=35), 0.35, volume=float("nan"))
     data = _scan(ff_chains, earnings=AS_OF + timedelta(days=40)).to_dict()
     json.dumps(data, allow_nan=False)
     assert data["front_window"] == [21, 45]
@@ -271,6 +349,7 @@ def test_to_dict_is_strict_json(ff_chains):
     assert best["result"]["ff"]["op"] == ">="
     assert best["structure"] in ("call", "put", "double_35d")
     assert isinstance(best["strikes"], list)
+    assert data["strike"] is None and data["strike_range"] == 1
 
 
 def _section(lines, header):
@@ -299,10 +378,10 @@ def test_format_scan_ranked_table(ff_chains):
     rows = _section(lines, "Rank ")
     header = next(line for line in lines if line.startswith("Rank "))
 
-    assert "Spread" in header and "Close by" in header
+    assert header.split()[10:12] == ["Vol", "OI"] and "Close by" in header
     assert any("call ATM" in row for row in rows)
     assert any("dbl 35d" in row and "100.00/110.00" in row for row in rows)
-    assert any(row.rstrip().endswith("FAIL spread") for row in rows)
+    assert any(row.rstrip().endswith("FAIL volume") for row in rows)
     assert any(row.rstrip().endswith("PASS") for row in rows)
     assert any("2026-11-16" in row for row in rows)  # close by for the 28 DTE front
 
@@ -311,13 +390,15 @@ def test_format_scan_header_and_breakdowns(ff_chains):
     text = format_scan(_scan(ff_chains, earnings=AS_OF + timedelta(days=40)))
     lines = text.splitlines()
     assert lines[0] == "TEST"
-    assert "trades pass: FF >= 0.2" in lines[1] and "10% of mid" in lines[1]
+    assert "trades pass: FF >= 0.2" in lines[1]
+    assert "every leg volume >= 100 and open interest >= 1,000" in lines[1]
     assert "Next earnings 2026-11-29: trades whose back expiry is on/after it fail." in lines
     assert all(f"#{i} " in text for i in (1, 2, 3))
     assert "#4 " not in text
     assert "close by 2026-11-" in text
     assert text.count("forward variance") == 3
-    assert text.count("max leg spread") == 3
+    assert text.count("min leg volume") == 3
+    assert text.count("min leg open int") == 3
     assert "earnings          FAIL" in text
 
 
@@ -327,6 +408,20 @@ def test_format_scan_without_earnings(ff_chains):
     assert "none found" in text.split("#1 ")[1]
 
 
+def test_format_scan_strike_line(ff_chains):
+    assert "Strikes: nearest spot +/- 1 step" in format_scan(_scan(ff_chains)).splitlines()
+    assert "Strikes: nearest spot +/- 2 steps" in format_scan(_scan(ff_chains, Params(strike_range=2))).splitlines()
+
+    lines = format_scan(_scan(ff_chains, Params(strike=110.0))).splitlines()
+    assert "Strike: 110.00 only (pairs listing it on both legs)  |  double calendar skipped" in lines
+    assert not any("dbl 35d  " in line and "@" in line for line in lines)
+
+
+def test_cli_rejects_strike_with_range():
+    with pytest.raises(SystemExit):
+        main(["AAPL", "--strike", "66", "--range", "2"])
+
+
 def test_format_scan_respects_top(ff_chains):
     text = format_scan(_scan(ff_chains), top=2)
     assert "#2 " in text and "#3 " not in text
@@ -334,6 +429,6 @@ def test_format_scan_respects_top(ff_chains):
 
 def test_format_scan_shows_undefined_ff():
     chains = [make_chain(AS_OF + timedelta(days=28), 0.90), make_chain(AS_OF + timedelta(days=63), 0.30)]
-    text = format_scan(_scan(chains, Params(strikes=1)))
+    text = format_scan(_scan(chains, Params(strike_range=0)))
     assert "FAIL ff" in text
     assert "undefined (negative fwd variance)" in text

@@ -1,8 +1,9 @@
 import math
 
+import pandas as pd
 import pytest
 
-from analytics.chain import mid, quote_at_delta, spread_pct
+from analytics.chain import contracts, mid, quote_at_delta
 from analytics.greeks import delta, norm_cdf
 
 from conftest import AS_OF, make_chain
@@ -34,11 +35,11 @@ def test_delta_without_time_or_vol_is_intrinsic():
     assert delta("put", 95.0, 100.0, 0.0, 0.1) == -1.0
 
 
-def test_mid_and_spread():
-    quote = {"bid": 2.0, "ask": 2.2}
+def test_mid_and_contracts():
+    quote = pd.Series({"bid": 2.0, "ask": 2.2, "volume": float("nan"), "open_interest": 1_200.0})
     assert mid(quote) == pytest.approx(2.1)
-    assert spread_pct(quote) == pytest.approx(0.2 / 2.1)
-    assert spread_pct({"bid": 0.0, "ask": 0.0}) == math.inf
+    assert contracts(quote, "volume") == 0.0
+    assert contracts(quote, "open_interest") == 1_200.0
 
 
 def test_quote_at_delta_picks_closest_listed_strike():

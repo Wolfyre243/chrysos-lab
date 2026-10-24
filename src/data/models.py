@@ -10,8 +10,9 @@ from typing import Literal
 
 import pandas as pd
 
-# Columns every provider must supply for each side of an option chain.
-CHAIN_COLUMNS = ("strike", "iv", "bid", "ask")
+# Columns every provider must supply for each side of an option chain. volume is
+# contracts traded today (NaN when none); open_interest is as of the last close.
+CHAIN_COLUMNS = ("strike", "iv", "bid", "ask", "volume", "open_interest")
 
 OptionSide = Literal["call", "put"]
 SIDES: tuple[OptionSide, ...] = ("call", "put")

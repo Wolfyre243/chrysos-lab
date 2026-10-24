@@ -3,8 +3,9 @@
     uv run forward-factor AAPL MSFT                 # scan each symbol
     uv run forward-factor                           # prompt for symbols until blank / exit
     uv run forward-factor AAPL --json               # structured output
-    uv run forward-factor AAPL --strikes 7 --top 15
-    uv run forward-factor AAPL --max-spread 5       # stricter bid-ask limit (% of mid)
+    uv run forward-factor AAPL --strike 350         # best expiry pairs for the 350 strike only
+    uv run forward-factor AAPL --range 2 --top 15   # 2 strike steps above and below spot
+    uv run forward-factor AAPL --min-oi 5000        # stricter open interest per leg
 """
 
 import argparse
@@ -25,7 +26,7 @@ _NAMES: dict[Structure, str] = {
 }
 
 _TYPE_HEADERS = ("Type", "Trades", "Pass", "Best FF", "Best trade")
-_RANK_HEADERS = ("Rank", "Type", "Front", "DTE", "Back", "DTE", "Strike", "IV1", "IV2", "FF", "Spread", "Close by", "Result")
+_RANK_HEADERS = ("Rank", "Type", "Front", "DTE", "Back", "DTE", "Strike", "IV1", "IV2", "FF", "Vol", "OI", "Close by", "Result")
 
 
 def format_scan(scan: ScanResult, top: int = 10) -> str:
@@ -38,10 +39,12 @@ def format_scan(scan: ScanResult, top: int = 10) -> str:
     lines = [
         scan.symbol,
         f"{passing} of {len(scan.candidates)} trades pass: FF >= {scan.min_ff:g}, no earnings "
-        f"before the back expiry, every leg's bid-ask <= {scan.max_spread * 100:g}% of mid",
+        f"before the back expiry, every leg volume >= {scan.min_volume:,.0f} and "
+        f"open interest >= {scan.min_open_interest:,.0f}",
         "",
         f"Spot {scan.spot:,.2f}  |  DTE windows: front {window_label(scan.front_window)}, "
         f"back {window_label(scan.back_window)}  |  As of {scan.as_of.isoformat()}",
+        _strike_line(scan),
         earnings,
     ]
     if scan.widened:
@@ -62,7 +65,7 @@ def format_scan(scan: ScanResult, top: int = 10) -> str:
 
 
 def format_candidate(c: Candidate, scan: ScanResult) -> str:
-    """Forward vol working plus the spread and earnings checks for one trade."""
+    """Forward vol working plus the liquidity and earnings checks for one trade."""
     earnings = (
         "FAIL" if c.crosses_earnings else "PASS",
         "none found" if scan.earnings is None else scan.earnings.isoformat(),
@@ -70,7 +73,8 @@ def format_candidate(c: Candidate, scan: ScanResult) -> str:
     )
     rows = [
         *_breakdown_rows(c.result),
-        check_row("max leg spread", c.spread, "{:.1%}"),
+        check_row("min leg volume", c.volume, "{:,.0f}"),
+        check_row("min leg open int", c.open_interest, "{:,.0f}"),
         ("earnings", *earnings),
     ]
     return "\n".join(format_table(CHECK_HEADERS, rows))
@@ -106,6 +110,13 @@ def _breakdown_rows(result: Result) -> list[tuple[str, str, str, str]]:
     return rows
 
 
+def _strike_line(scan: ScanResult) -> str:
+    if scan.strike is not None:
+        return f"Strike: {scan.strike:,.2f} only (pairs listing it on both legs)  |  double calendar skipped"
+    plural = "" if scan.strike_range == 1 else "s"
+    return f"Strikes: nearest spot +/- {scan.strike_range} step{plural}"
+
+
 def _type_row(scan: ScanResult, structure: Structure) -> tuple[str, ...]:
     """Trade count, passes and best trade for one structure (candidates are already ranked)."""
     trades = [c for c in scan.candidates if c.structure == structure]
@@ -132,7 +143,8 @@ def _rank_row(rank: int, c: Candidate) -> tuple[str, ...]:
         f"{r.iv1:.2%}",
         f"{r.iv2:.2%}",
         "n/a" if r.ff is None else f"{r.ff.value:.3f}",
-        f"{c.spread.value:.1%}",
+        f"{c.volume.value:,.0f}",
+        f"{c.open_interest.value:,.0f}",
         c.close_by.isoformat(),
         "PASS" if c.passed else f"FAIL {','.join(c.flags)}",
     )
@@ -161,6 +173,13 @@ def _positive_int(text: str) -> int:
     return value
 
 
+def _non_negative_int(text: str) -> int:
+    value = int(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be 0 or more")
+    return value
+
+
 def _positive_float(text: str) -> float:
     value = float(text)
     if value <= 0:
@@ -170,25 +189,44 @@ def _positive_float(text: str) -> float:
 
 def main(argv: list[str] | None = None) -> int:
     parser = base_parser("Forward factor scanner: ranks calendar trades near 30/60 DTE.")
-    parser.add_argument(
-        "--strikes",
-        type=_positive_int,
-        default=Params.strikes,
-        help="Strikes nearest spot checked per expiry pair and side (default %(default)s).",
+    strikes = parser.add_mutually_exclusive_group()
+    strikes.add_argument(
+        "--strike",
+        type=_positive_float,
+        help="Scan only this exact strike and rank the expiry pairs that list it on both legs.",
+    )
+    strikes.add_argument(
+        "--range",
+        type=_non_negative_int,
+        default=Params.strike_range,
+        dest="strike_range",
+        help="Strike steps above and below the strike nearest spot, whatever the chain's increment "
+        "(default %(default)s).",
     )
     parser.add_argument(
         "--top", type=_positive_int, default=10, help="Ranked trades to list (default %(default)s)."
     )
     parser.add_argument(
-        "--max-spread",
-        type=_positive_float,
-        default=Params.max_spread * 100,
-        help="Widest bid-ask allowed on any leg, as %% of mid (default %(default)g).",
+        "--min-volume",
+        type=_non_negative_int,
+        default=int(Params.min_volume),
+        help="Contracts every leg must have traded today (default %(default)s).",
+    )
+    parser.add_argument(
+        "--min-oi",
+        type=_non_negative_int,
+        default=int(Params.min_open_interest),
+        help="Open interest every leg must have (default %(default)s).",
     )
     args = parser.parse_args(argv)
 
     provider = YFinanceProvider()
-    params = Params(strikes=args.strikes, max_spread=args.max_spread / 100)
+    params = Params(
+        strike=args.strike,
+        strike_range=args.strike_range,
+        min_volume=args.min_volume,
+        min_open_interest=args.min_oi,
+    )
 
     def handle(symbol: str) -> bool:
         return report(

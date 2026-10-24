@@ -1,6 +1,5 @@
 """Pure helpers for picking quotes out of option chains. No data fetching here."""
 
-import math
 from collections.abc import Collection, Iterable
 
 import pandas as pd
@@ -39,10 +38,10 @@ def mid(quote: pd.Series) -> float:
     return (float(quote["bid"]) + float(quote["ask"])) / 2.0
 
 
-def spread_pct(quote: pd.Series) -> float:
-    """Bid-ask spread as a fraction of mid; inf when there is no positive mid."""
-    m = mid(quote)
-    return (float(quote["ask"]) - float(quote["bid"])) / m if m > 0 else math.inf
+def contracts(quote: pd.Series, column: str) -> float:
+    """A contract count (``volume`` or ``open_interest``); missing counts as 0."""
+    value = quote[column]
+    return 0.0 if pd.isna(value) else float(value)
 
 
 def quote_at_delta(
@@ -65,14 +64,25 @@ def quote_at_delta(
     return rows.loc[(deltas - target).abs().idxmin()]
 
 
-def common_strikes(
-    chains: Iterable[OptionChain], spot: float, n: int, sides: Iterable[OptionSide] = SIDES
-) -> list[float]:
-    """The ``n`` strikes nearest ``spot`` listed on every given side of every chain, ascending."""
+def listed_strikes(chains: Iterable[OptionChain], sides: Iterable[OptionSide] = SIDES) -> set[float]:
+    """Strikes listed on every given side of every chain."""
     sides = tuple(sides)
     strikes: set[float] | None = None
     for chain in chains:
         listed = set.intersection(*(set(chain.side(side)["strike"]) for side in sides))
         strikes = listed if strikes is None else strikes & listed
-    nearest = sorted(strikes or (), key=lambda k: (abs(k - spot), k))[:n]
-    return sorted(nearest)
+    return strikes or set()
+
+
+def strikes_around(
+    chains: Iterable[OptionChain], target: float, width: int, sides: Iterable[OptionSide] = SIDES
+) -> list[float]:
+    """The listed strike nearest ``target`` plus up to ``width`` listed strikes either side, ascending.
+
+    Strikes must be listed on every given side of every chain. Ties go to the lower strike.
+    """
+    ladder = sorted(listed_strikes(chains, sides))
+    if not ladder:
+        return []
+    center = min(range(len(ladder)), key=lambda i: (abs(ladder[i] - target), ladder[i]))
+    return ladder[max(0, center - width) : center + width + 1]

@@ -6,7 +6,7 @@ import yfinance as yf
 
 from data.models import CHAIN_COLUMNS, PRICE_COLUMNS, OptionChain
 
-_CHAIN_RENAME = {"impliedVolatility": "iv"}
+_CHAIN_RENAME = {"impliedVolatility": "iv", "openInterest": "open_interest"}
 
 
 class YFinanceProvider:
