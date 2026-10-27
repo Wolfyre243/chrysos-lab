@@ -4,6 +4,7 @@ reporting and plain-text tables."""
 import argparse
 import json
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import TypeVar
 
 from calculators.results import Check, Serializable
@@ -23,14 +24,32 @@ def report(symbol: str, compute: Callable[[str], R], render: Callable[[R], str],
     """Compute and print one symbol's result; print the error instead if it fails."""
     try:
         result = compute(symbol)
-    except CalculatorError as e:
-        print(f"Error: {e}")
-        return False
-    except Exception as e:  # data provider failures, unexpected data shapes
-        print(f"Error occurred processing {symbol.strip().upper()}: {e}")
+    except Exception as e:  # calculator errors, data provider failures, unexpected data shapes
+        print("\n".join(failure_lines(symbol, e)))
         return False
     print(json.dumps(result.to_dict(), indent=2) if as_json else render(result))
     return True
+
+
+def failure_lines(symbol: str, error: Exception) -> list[str]:
+    """The lines reporting why ``symbol`` could not be computed."""
+    if isinstance(error, CalculatorError):
+        lines = [f"Error: {error}"]
+        if error.__cause__ is not None:  # the data provider failure behind it
+            lines.append(f"  Caused by {_describe(error.__cause__)}")
+        return lines
+    return [f"Error occurred processing {symbol.strip().upper()}: {_describe(error)}"]
+
+
+def read_symbols(path: str | Path) -> list[str]:
+    """Symbols from a text file, one per line; blank lines and ``#`` comments are skipped and
+    duplicates dropped. Raises OSError when the file cannot be read."""
+    symbols: dict[str, None] = {}  # insertion-ordered set
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        symbol = line.split("#", 1)[0].strip().upper()
+        if symbol:
+            symbols[symbol] = None
+    return list(symbols)
 
 
 def run_symbols(symbols: Sequence[str], handle: Callable[[str], bool]) -> int:
@@ -75,6 +94,11 @@ def check_row(name: str, check: Check, fmt: str) -> tuple[str, str, str, str]:
         fmt.format(check.value),
         f"{check.op} {fmt.format(check.threshold)}",
     )
+
+
+def _describe(error: BaseException) -> str:
+    """Exception type and message; the type alone tells e.g. a rate limit from a KeyError."""
+    return f"{type(error).__name__}: {error}"
 
 
 def _join(cells: Sequence[str], widths: list[int]) -> str:

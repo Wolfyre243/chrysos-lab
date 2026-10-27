@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from datetime import date, timedelta
 
 import pandas as pd
@@ -6,7 +7,8 @@ import pytest
 
 from analytics.chain import strikes_around
 from calculators import forward_factor
-from cli.forward_factor import format_scan, main
+from cli import forward_factor as cli
+from cli.forward_factor import format_bulk, format_scan, main, scan_bulk
 from data.market_calendar import previous_trading_day
 from data.models import OptionChain
 from errors import CalculatorError
@@ -432,3 +434,149 @@ def test_format_scan_shows_undefined_ff():
     text = format_scan(_scan(chains, Params(strike_range=0)))
     assert "FAIL ff" in text
     assert "undefined (negative fwd variance)" in text
+
+
+# --- bulk ------------------------------------------------------------------
+
+
+def _symbol_scan(symbol, chains, params=Params(), earnings=None):
+    return scan(Inputs(symbol=symbol, as_of=AS_OF, spot=SPOT, chains=chains, earnings=earnings), params)
+
+
+def _bulk(outcomes, params=Params()):
+    """scan_bulk over symbol -> ScanResult or exception to raise."""
+
+    def compute(symbol):
+        outcome = outcomes[symbol]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    return scan_bulk(list(outcomes), compute, params, AS_OF, "ff.txt")
+
+
+@pytest.fixture
+def bulk_outcomes(ff_chains):
+    """FEW passes some trades, MANY more (the thin 110 strike clears a 0 volume floor), NONE is
+    blocked by earnings everywhere and BAD fails to fetch."""
+    error = CalculatorError("No options found for BAD.")
+    error.__cause__ = ConnectionError("Too Many Requests")
+    return {
+        "FEW": _symbol_scan("FEW", ff_chains),
+        "NONE": _symbol_scan("NONE", ff_chains, earnings=AS_OF + timedelta(days=40)),
+        "BAD": error,
+        "MANY": _symbol_scan("MANY", ff_chains, Params(min_volume=0)),
+    }
+
+
+def test_scan_bulk_ranks_by_passing_trades(bulk_outcomes):
+    result = _bulk(bulk_outcomes)
+
+    assert [t.symbol for t in result.ranked] == ["MANY", "FEW"]
+    assert result.ranked[0].passed > result.ranked[1].passed > 0
+    assert result.empty == ["NONE"]
+    assert [f.symbol for f in result.failed] == ["BAD"]
+    assert result.failed[0].error.splitlines() == [
+        "Error: No options found for BAD.",
+        "  Caused by ConnectionError: Too Many Requests",
+    ]
+    assert result.total == 4
+
+
+def test_scan_bulk_best_is_highest_ff_passing_trade(bulk_outcomes):
+    ticker = _bulk(bulk_outcomes).ranked[1]
+    scan_result = bulk_outcomes["FEW"]
+    passing = [c for c in scan_result.candidates if c.passed]
+
+    assert ticker.best.passed
+    assert ticker.best.result.ff.value == max(c.result.ff.value for c in passing)
+    assert (ticker.trades, ticker.passed) == (len(scan_result.candidates), len(passing))
+
+
+def test_scan_bulk_breaks_ties_by_best_ff(ff_chains):
+    lo = _symbol_scan("LO", ff_chains)
+    best = lo.candidates[0]
+    assert best.passed
+    boosted = replace(best, result=replace(best.result, ff=replace(best.result.ff, value=best.result.ff.value + 1)))
+    hi = replace(lo, symbol="HI", candidates=[boosted, *lo.candidates[1:]])
+
+    result = _bulk({"LO": lo, "HI": hi})
+    assert result.ranked[0].passed == result.ranked[1].passed
+    assert [t.symbol for t in result.ranked] == ["HI", "LO"]
+
+
+def test_scan_bulk_prints_progress_to_stderr(bulk_outcomes, capsys):
+    _bulk(bulk_outcomes)
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err.splitlines()[0] == "Scanning FEW (1/4)..."
+    assert err.splitlines()[-1] == "Scanning MANY (4/4)..."
+
+
+def test_format_bulk(bulk_outcomes):
+    text = format_bulk(_bulk(bulk_outcomes))
+    lines = text.splitlines()
+    rows = _section(lines, "Rank ")
+    header = next(line for line in lines if line.startswith("Rank "))
+
+    assert lines[0] == "Bulk scan: 4 tickers from ff.txt  |  As of 2026-10-20"
+    assert lines[1].startswith("2 with passing trades, 1 with none, 1 failed. Pass: FF >= 0.2")
+    assert header.split()[:6] == ["Rank", "Symbol", "Spot", "Pass", "Trades", "Type"]
+    assert "Close by" in header and "Result" not in header
+    assert [row.split()[1] for row in rows] == ["MANY", "FEW"]
+    assert not any("NONE" in line for line in lines)
+    assert any(line.startswith("#1  MANY  ") for line in lines)
+    assert any(line.startswith("#2  FEW  ") for line in lines)
+    assert text.count("forward variance") == 2
+    assert lines[-3:] == [
+        "Failed (1):",
+        "BAD  Error: No options found for BAD.",
+        "       Caused by ConnectionError: Too Many Requests",
+    ]
+
+
+def test_format_bulk_without_passing_tickers(bulk_outcomes):
+    text = format_bulk(_bulk({"NONE": bulk_outcomes["NONE"]}))
+    assert "No ticker has a passing trade." in text.splitlines()
+    assert "Rank " not in text and "Failed" not in text
+
+
+def test_bulk_to_dict_is_strict_json(bulk_outcomes):
+    data = _bulk(bulk_outcomes).to_dict()
+    json.dumps(data, allow_nan=False)
+    assert data["as_of"] == AS_OF.isoformat()
+    assert [t["symbol"] for t in data["ranked"]] == ["MANY", "FEW"]
+    assert data["ranked"][0]["best"]["passed"] is True
+    assert data["empty"] == ["NONE"]
+    assert data["failed"][0]["symbol"] == "BAD"
+
+
+def test_cli_bulk_scans_file(ff_chains, tmp_path, monkeypatch, capsys):
+    path = tmp_path / "ff.txt"
+    path.write_text("aapl\n\n# watchlist\nmsft\n", encoding="utf-8")
+    monkeypatch.setattr(cli, "YFinanceProvider", lambda: FakeProvider(ff_chains))
+    monkeypatch.setattr(cli, "market_date", lambda: AS_OF)
+
+    assert main(["--bulk", str(path)]) == 0
+    out, err = capsys.readouterr()
+    assert "Scanning MSFT (2/2)..." in err
+    assert [row.split()[1] for row in _section(out.splitlines(), "Rank ")] == ["AAPL", "MSFT"]
+
+    assert main(["--bulk", str(path), "--json"]) == 0
+    assert len(json.loads(capsys.readouterr().out)["ranked"]) == 2
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--bulk", "missing.txt"],
+        ["AAPL", "--bulk", "{empty}"],
+        ["--bulk", "{empty}"],
+    ],
+)
+def test_cli_bulk_rejects_bad_input(argv, tmp_path, monkeypatch):
+    empty = tmp_path / "empty.txt"
+    empty.write_text("\n# nothing here\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SystemExit):
+        main([arg.format(empty=empty) for arg in argv])
