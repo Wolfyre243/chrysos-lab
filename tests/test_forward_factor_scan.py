@@ -12,7 +12,7 @@ from cli.forward_factor import format_bulk, format_scan, main, scan_bulk
 from data.market_calendar import previous_trading_day
 from data.models import OptionChain
 from errors import CalculatorError
-from scanners.forward_factor import Inputs, Params, pick_legs, run, scan
+from scanners.forward_factor import Inputs, Params, pick_pairs, run, scan
 
 from conftest import AS_OF, SPOT, FakeProvider, make_chain
 
@@ -32,8 +32,9 @@ def _expiries(*dtes):
 
 @pytest.fixture
 def ff_chains() -> list[OptionChain]:
-    """Fronts at 28 and 35 DTE, back at 63; 7 and 120 DTE sit outside the default windows."""
-    ivs = {7: 0.70, 28: 0.40, 35: 0.35, 63: 0.30, 120: 0.25}
+    """Fronts at 28 and 35 DTE, back at 63. 3 DTE is under the front floor, 200 DTE is over 120
+    days after either front and 28 -> 35 is under the 14-day gap, so no other pair forms."""
+    ivs = {3: 0.70, 28: 0.40, 35: 0.35, 63: 0.30, 200: 0.25}
     return [make_chain(AS_OF + timedelta(days=d), iv) for d, iv in ivs.items()]
 
 
@@ -48,32 +49,32 @@ def _blocked(c):
 # --- leg selection ---------------------------------------------------------
 
 
-def test_pick_legs_uses_default_windows():
-    legs = pick_legs(_expiries(0, 7, 14, 28, 35, 49, 63, 91, 120), AS_OF)
-    assert _days(legs.front) == [28, 35]
-    assert _days(legs.back) == [63]
-    assert (legs.front_window, legs.back_window) == ((21, 45), (50, 90))
-    assert not legs.widened
+LISTED = _expiries(0, 3, 7, 14, 28, 35, 63, 91, 150, 200)
 
 
-def test_pick_legs_widens_only_empty_windows():
-    legs = pick_legs(_expiries(30, 120), AS_OF)
-    assert _days(legs.front) == [30]
-    assert _days(legs.back) == [120]
-    assert legs.front_window == (21, 45)  # front had an expiry, so it never moved
-    assert legs.back_window == (15, 125)
-    assert legs.widened
+def _pair_days(pairs):
+    return [((front - AS_OF).days, (back - AS_OF).days) for front, back in pairs]
 
 
-def test_pick_legs_widens_both_when_both_empty():
-    legs = pick_legs(_expiries(10, 100), AS_OF)
-    assert (_days(legs.front), _days(legs.back)) == ([10], [100])
-    assert (legs.front_window, legs.back_window) == ((7, 59), (36, 104))
+def test_pick_pairs_uses_default_ranges():
+    # Fronts 7-60 DTE, backs 14-120 days later: 0 and 3 are too near, 150 and 200 too far for most fronts.
+    assert _pair_days(pick_pairs(LISTED, AS_OF)) == [
+        (7, 28), (7, 35), (7, 63), (7, 91),
+        (14, 28), (14, 35), (14, 63), (14, 91),
+        (28, 63), (28, 91),
+        (35, 63), (35, 91), (35, 150),
+    ]  # fmt: skip
 
 
-def test_pick_legs_raises_when_nothing_fits():
-    with pytest.raises(CalculatorError, match="No expiry pair fits"):
-        pick_legs(_expiries(0, 5), AS_OF)
+def test_pick_pairs_custom_ranges():
+    params = Params(front_dte=(21, 45), gap=(28, 60))
+    assert _pair_days(pick_pairs(LISTED, AS_OF, params)) == [(28, 63), (35, 63), (35, 91)]
+
+
+@pytest.mark.parametrize("dtes", [(0, 5), (10, 200), (28, 35)])
+def test_pick_pairs_raises_when_nothing_fits(dtes):
+    with pytest.raises(CalculatorError, match="No expiry pair has a front leg at 7-60 DTE and a back leg 14-120"):
+        pick_pairs(_expiries(*dtes), AS_OF)
 
 
 # --- strikes ---------------------------------------------------------------
@@ -313,7 +314,7 @@ def test_scan_raises_without_shared_strikes():
 # --- run() with a fake provider ---------------------------------------------
 
 
-def test_run_fetches_only_window_expiries(ff_chains):
+def test_run_fetches_only_paired_expiries(ff_chains):
     provider = FakeProvider(ff_chains)
     result = run(" test ", provider=provider, as_of=AS_OF)
     assert result.symbol == "TEST"
@@ -344,7 +345,7 @@ def test_to_dict_is_strict_json(ff_chains):
     ff_chains[2] = make_chain(AS_OF + timedelta(days=35), 0.35, volume=float("nan"))
     data = _scan(ff_chains, earnings=AS_OF + timedelta(days=40)).to_dict()
     json.dumps(data, allow_nan=False)
-    assert data["front_window"] == [21, 45]
+    assert (data["front_dte"], data["gap"]) == ([7, 60], [14, 120])
     assert data["earnings"] == (AS_OF + timedelta(days=40)).isoformat()
     best = data["candidates"][0]
     assert best["front_expiry"] == (AS_OF + timedelta(days=best["front_dte"])).isoformat()
@@ -394,6 +395,7 @@ def test_format_scan_header_and_breakdowns(ff_chains):
     assert lines[0] == "TEST"
     assert "trades pass: FF >= 0.2" in lines[1]
     assert "every leg volume >= 100 and open interest >= 1,000" in lines[1]
+    assert "Front leg 7-60 DTE, back leg 14-120 days after it" in lines[3]
     assert "Next earnings 2026-11-29: trades whose back expiry is on/after it fail." in lines
     assert all(f"#{i} " in text for i in (1, 2, 3))
     assert "#4 " not in text
@@ -566,12 +568,26 @@ def test_cli_bulk_scans_file(ff_chains, tmp_path, monkeypatch, capsys):
     assert len(json.loads(capsys.readouterr().out)["ranked"]) == 2
 
 
+def test_cli_passes_dte_ranges(ff_chains, tmp_path, monkeypatch, capsys):
+    path = tmp_path / "ff.txt"
+    path.write_text("aapl\n", encoding="utf-8")
+    monkeypatch.setattr(cli, "YFinanceProvider", lambda: FakeProvider(ff_chains))
+    monkeypatch.setattr(cli, "market_date", lambda: AS_OF)
+
+    assert main(["--bulk", str(path), "--front-dte", "30", "45", "--gap", "20", "40"]) == 0
+    out = capsys.readouterr().out
+    assert "Front leg 30-45 DTE, back leg 20-40 days after it" in out.splitlines()
+    assert "2026-11-24 (35d) / 2026-12-22 (63d)" in out  # 28 DTE front is now out of range
+
+
 @pytest.mark.parametrize(
     "argv",
     [
         ["--bulk", "missing.txt"],
         ["AAPL", "--bulk", "{empty}"],
         ["--bulk", "{empty}"],
+        ["AAPL", "--front-dte", "30", "10"],
+        ["AAPL", "--gap", "0", "5"],
     ],
 )
 def test_cli_bulk_rejects_bad_input(argv, tmp_path, monkeypatch):

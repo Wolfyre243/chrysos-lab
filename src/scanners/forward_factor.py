@@ -1,6 +1,7 @@
 """Forward factor scan: find the best calendar trades for a ticker.
 
-Picks front expiries near 30 DTE and back expiries near 60 DTE and, for every
+Pairs every listed front expiry inside the ``front_dte`` range (default 7-60 DTE)
+with every back expiry ``gap`` days after it (default 14-120) and, for every
 front/back pair, scores three calendar structures (same strikes on both legs):
 
 - call: call calendar at each strike in the window: the strike nearest spot plus
@@ -19,9 +20,6 @@ expiry, and every leg has traded at least min_volume contracts today with at lea
 min_open_interest open. Trades blocked by earnings or liquidity rank below the rest;
 each group is sorted by FF, highest first. Each trade also carries a close-by date:
 the weekday before the front expiry.
-
-A DTE window is widened only when no listed expiry falls inside it (e.g. names with
-monthly expiries only), never because no trade passes.
 
 The FF formula lives in ``calculators.forward_factor``; this module only chooses
 what to feed it. ``scan`` is pure; ``run`` fetches through a MarketDataProvider.
@@ -53,17 +51,16 @@ from data.models import SIDES, OptionChain, OptionSide
 from data.provider import MarketDataProvider
 from errors import CalculatorError
 
-Window = tuple[int, int]  # inclusive DTE range
+Window = tuple[int, int]  # inclusive range of days
+Pair = tuple[date, date]  # (front, back) expiries
 Structure = Literal["call", "put", "double_35d"]
 STRUCTURES: tuple[Structure, ...] = ("call", "put", "double_35d")
 
 
 @dataclass(frozen=True)
 class Params:
-    front_window: Window = (21, 45)  # around 30 DTE
-    back_window: Window = (50, 90)  # around 60 DTE
-    widen_step: int = 7  # days added to each end of an empty window
-    max_widen_steps: int = 6
+    front_dte: Window = (7, 60)  # DTE of the front leg
+    gap: Window = (14, 120)  # days from the front expiry to the back expiry
     strike: float | None = None  # scan only this strike; None means a window around spot
     strike_range: int = 1  # strike steps above and below the strike nearest spot
     min_volume: float = 100  # contracts each leg must have traded today
@@ -80,15 +77,6 @@ class Inputs:
     spot: float
     chains: list[OptionChain]
     earnings: date | None = None  # next earnings date on or after as_of
-
-
-@dataclass(frozen=True)
-class Legs:
-    front: list[date]
-    back: list[date]
-    front_window: Window
-    back_window: Window
-    widened: bool
 
 
 @dataclass(frozen=True)
@@ -114,9 +102,8 @@ class ScanResult(Serializable):
     symbol: str
     as_of: date
     spot: float
-    front_window: Window
-    back_window: Window
-    widened: bool
+    front_dte: Window
+    gap: Window
     min_ff: float
     min_volume: float
     min_open_interest: float
@@ -127,76 +114,66 @@ class ScanResult(Serializable):
     skipped_stale: int = 0  # trades dropped because a quote was stale
 
 
-def pick_legs(expiries: Iterable[date], as_of: date, params: Params = Params()) -> Legs:
-    """Expiries inside the front and back DTE windows, widening a window while it is empty.
+def pick_pairs(expiries: Iterable[date], as_of: date, params: Params = Params()) -> list[Pair]:
+    """Every (front, back) pair with the front inside ``front_dte`` and the back ``gap`` days after it.
 
-    Back expiries must fall after the earliest front expiry; expiries on ``as_of`` are dropped.
+    Pairs are ordered by front, then back; expiries on or before ``as_of`` are dropped.
     """
-    dtes = {expiry: (expiry - as_of).days for expiry in sorted(set(expiries)) if expiry > as_of}
-    front_window, back_window = params.front_window, params.back_window
-
-    for step in range(params.max_widen_steps + 1):
-        front = [e for e, d in dtes.items() if front_window[0] <= d <= front_window[1]]
-        back = [
-            e for e, d in dtes.items() if back_window[0] <= d <= back_window[1] and (not front or e > front[0])
-        ]
-        if front and back:
-            return Legs(front, back, front_window, back_window, widened=step > 0)
-        if step == params.max_widen_steps:
-            break
-        if not front:
-            front_window = _widen(front_window, params.widen_step)
-        if not back:
-            back_window = _widen(back_window, params.widen_step)
-
-    raise CalculatorError(
-        f"No expiry pair fits front {window_label(front_window)} / back {window_label(back_window)} DTE, "
-        "even after widening."
-    )
+    listed = sorted({expiry for expiry in expiries if expiry > as_of})
+    pairs = [
+        (front, back)
+        for front in listed
+        if _within((front - as_of).days, params.front_dte)
+        for back in listed
+        if _within((back - front).days, params.gap)
+    ]
+    if not pairs:
+        raise CalculatorError(
+            f"No expiry pair has a front leg at {window_label(params.front_dte)} DTE and a back leg "
+            f"{window_label(params.gap)} days after it."
+        )
+    return pairs
 
 
 def scan(inputs: Inputs, params: Params = Params()) -> ScanResult:
     """Rank every trade on already-fetched chains. Pure: no network, no clock."""
-    legs = pick_legs((c.expiry for c in inputs.chains), inputs.as_of, params)
+    pairs = pick_pairs((c.expiry for c in inputs.chains), inputs.as_of, params)
     chains = {c.expiry: c for c in inputs.chains}
 
     candidates: list[Candidate] = []
     skipped = 0
     shared: set[float] = set()  # strikes listed on both legs of some pair
-    for front_expiry in legs.front:
-        for back_expiry in legs.back:
-            if back_expiry <= front_expiry:
-                continue
-            front, back = chains[front_expiry], chains[back_expiry]
-            atm_strikes = strikes_around((front, back), inputs.spot, 0, sides=("call",))
+    for front_expiry, back_expiry in pairs:
+        front, back = chains[front_expiry], chains[back_expiry]
+        atm_strikes = strikes_around((front, back), inputs.spot, 0, sides=("call",))
 
-            for side in SIDES:
-                listed = listed_strikes((front, back), (side,))
-                shared |= listed
-                if params.strike is None:
-                    window = strikes_around((front, back), inputs.spot, params.strike_range, sides=(side,))
-                else:
-                    window = [k for k in listed if math.isclose(k, params.strike)]
-                for strike in window:
-                    near = nearest_quote(front.side(side), strike)
-                    far = nearest_quote(back.side(side), strike)
-                    if is_stale(near) or is_stale(far):
-                        skipped += 1
-                        continue
-                    atm = side == "call" and strike in atm_strikes
-                    candidates.append(_candidate(side, (strike,), atm, (near,), (far,), front, back, inputs, params))
+        for side in SIDES:
+            listed = listed_strikes((front, back), (side,))
+            shared |= listed
+            if params.strike is None:
+                window = strikes_around((front, back), inputs.spot, params.strike_range, sides=(side,))
+            else:
+                window = [k for k in listed if math.isclose(k, params.strike)]
+            for strike in window:
+                near = nearest_quote(front.side(side), strike)
+                far = nearest_quote(back.side(side), strike)
+                if is_stale(near) or is_stale(far):
+                    skipped += 1
+                    continue
+                atm = side == "call" and strike in atm_strikes
+                candidates.append(_candidate(side, (strike,), atm, (near,), (far,), front, back, inputs, params))
 
-            if params.strike is not None:
-                continue
-            double = _double_legs(front, back, inputs, params)
-            if double is None:
-                continue
-            nears, fars = double
-            if any(is_stale(q) for q in (*nears, *fars)):
-                skipped += 1
-                continue
-            wing_strikes = tuple(float(q["strike"]) for q in nears)
-            candidates.append(_candidate("double_35d", wing_strikes, False, nears, fars, front, back, inputs, params))
+        if params.strike is not None:
+            continue
+        double = _double_legs(front, back, inputs, params)
+        if double is None:
+            continue
+        nears, fars = double
+        if any(is_stale(q) for q in (*nears, *fars)):
+            skipped += 1
+            continue
+        wing_strikes = tuple(float(q["strike"]) for q in nears)
+        candidates.append(_candidate("double_35d", wing_strikes, False, nears, fars, front, back, inputs, params))
 
     if not candidates:
         if skipped:
@@ -209,9 +186,8 @@ def scan(inputs: Inputs, params: Params = Params()) -> ScanResult:
         symbol=inputs.symbol,
         as_of=inputs.as_of,
         spot=inputs.spot,
-        front_window=legs.front_window,
-        back_window=legs.back_window,
-        widened=legs.widened,
+        front_dte=params.front_dte,
+        gap=params.gap,
         min_ff=params.calculator.min_ff,
         min_volume=params.min_volume,
         min_open_interest=params.min_open_interest,
@@ -236,8 +212,8 @@ def run(
     symbol, provider = resolve(symbol, provider)
     as_of = as_of or market_date()
 
-    legs = pick_legs(require_expirations(provider, symbol), as_of, params)
-    chains = [provider.option_chain(symbol, expiry) for expiry in sorted({*legs.front, *legs.back})]
+    pairs = pick_pairs(require_expirations(provider, symbol), as_of, params)
+    chains = [provider.option_chain(symbol, expiry) for expiry in sorted({e for pair in pairs for e in pair})]
     spot = require_spot(provider, symbol)
     earnings = provider.next_earnings(symbol, as_of)
 
@@ -320,8 +296,8 @@ def _unlisted_strike(strike: float, shared: set[float]) -> str:
     return f"No expiry pair lists the {strike:,.2f} strike on both legs. Nearest strikes that do: {nearest}."
 
 
-def _widen(window: Window, step: int) -> Window:
-    return (max(1, window[0] - step), window[1] + step)
+def _within(days: int, window: Window) -> bool:
+    return window[0] <= days <= window[1]
 
 
 def _rank(candidate: Candidate) -> tuple[bool, bool, float]:

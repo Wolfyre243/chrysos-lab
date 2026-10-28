@@ -6,6 +6,7 @@
     uv run forward-factor AAPL --strike 350         # best expiry pairs for the 350 strike only
     uv run forward-factor AAPL --range 2 --top 15   # 2 strike steps above and below spot
     uv run forward-factor AAPL --min-oi 5000        # stricter open interest per leg
+    uv run forward-factor AAPL --front-dte 21 45 --gap 28 60  # only ~30/60 style pairs
     uv run forward-factor --bulk ff.txt             # rank every ticker in ff.txt by passing trades
 """
 
@@ -31,7 +32,16 @@ from cli.shell import (
 from data.market_calendar import market_date
 from data.provider import MarketDataProvider
 from data.yfinance_provider import YFinanceProvider
-from scanners.forward_factor import STRUCTURES, Candidate, Params, ScanResult, Structure, run, window_label
+from scanners.forward_factor import (
+    STRUCTURES,
+    Candidate,
+    Params,
+    ScanResult,
+    Structure,
+    Window,
+    run,
+    window_label,
+)
 
 DETAIL = 3  # candidates given a full breakdown
 
@@ -69,6 +79,8 @@ class BulkResult(Serializable):
     source: str  # the ticker file
     as_of: date
     total: int  # tickers in the file
+    front_dte: Window
+    gap: Window
     min_ff: float
     min_volume: float
     min_open_interest: float
@@ -111,6 +123,8 @@ def scan_bulk(
         source=source,
         as_of=as_of,
         total=len(symbols),
+        front_dte=params.front_dte,
+        gap=params.gap,
         min_ff=params.calculator.min_ff,
         min_volume=params.min_volume,
         min_open_interest=params.min_open_interest,
@@ -128,6 +142,7 @@ def format_bulk(result: BulkResult) -> str:
         f"{len(result.ranked)} with passing trades, {len(result.empty)} with none, {len(result.failed)} failed. "
         f"Pass: {_rules(result.min_ff, result.min_volume, result.min_open_interest)}",
         _strike_line(result.strike, result.strike_range),
+        _dte_line(result.front_dte, result.gap),
         "",
     ]
     if result.ranked:
@@ -159,13 +174,10 @@ def format_scan(scan: ScanResult, top: int = 10) -> str:
         f"{passing} of {len(scan.candidates)} trades pass: "
         f"{_rules(scan.min_ff, scan.min_volume, scan.min_open_interest)}",
         "",
-        f"Spot {scan.spot:,.2f}  |  DTE windows: front {window_label(scan.front_window)}, "
-        f"back {window_label(scan.back_window)}  |  As of {scan.as_of.isoformat()}",
+        f"Spot {scan.spot:,.2f}  |  {_dte_line(scan.front_dte, scan.gap)}  |  As of {scan.as_of.isoformat()}",
         _strike_line(scan.strike, scan.strike_range),
         earnings,
     ]
-    if scan.widened:
-        lines.append("Windows widened: no listed expiries fit the default ones.")
     if scan.skipped_stale:
         lines.append(f"{scan.skipped_stale} trades skipped for stale quotes.")
 
@@ -239,6 +251,10 @@ def _strike_line(strike: float | None, strike_range: int) -> str:
         return f"Strike: {strike:,.2f} only (pairs listing it on both legs)  |  double calendar skipped"
     plural = "" if strike_range == 1 else "s"
     return f"Strikes: nearest spot +/- {strike_range} step{plural}"
+
+
+def _dte_line(front_dte: Window, gap: Window) -> str:
+    return f"Front leg {window_label(front_dte)} DTE, back leg {window_label(gap)} days after it"
 
 
 def _type_row(scan: ScanResult, structure: Structure) -> tuple[str, ...]:
@@ -345,7 +361,7 @@ def _run_bulk(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = base_parser("Forward factor scanner: ranks calendar trades near 30/60 DTE.")
+    parser = base_parser("Forward factor scanner: ranks calendar trades across front/back expiry pairs.")
     strikes = parser.add_mutually_exclusive_group()
     strikes.add_argument(
         "--strike",
@@ -376,15 +392,36 @@ def main(argv: list[str] | None = None) -> int:
         help="Open interest every leg must have (default %(default)s).",
     )
     parser.add_argument(
+        "--front-dte",
+        type=_positive_int,
+        nargs=2,
+        metavar=("MIN", "MAX"),
+        default=Params.front_dte,
+        help="DTE range of the front leg (default %d %d)." % Params.front_dte,
+    )
+    parser.add_argument(
+        "--gap",
+        type=_positive_int,
+        nargs=2,
+        metavar=("MIN", "MAX"),
+        default=Params.gap,
+        help="Days from the front expiry to the back expiry (default %d %d)." % Params.gap,
+    )
+    parser.add_argument(
         "--bulk",
         metavar="FILE",
         help="Scan every ticker in FILE (one per line; blank lines and # comments skipped) and rank "
         "tickers by passing trades, each with its best trade. --top does not apply.",
     )
     args = parser.parse_args(argv)
+    for flag, (low, high) in (("--front-dte", args.front_dte), ("--gap", args.gap)):
+        if low > high:
+            parser.error(f"{flag}: MIN {low} is above MAX {high}")
 
     provider = YFinanceProvider()
     params = Params(
+        front_dte=tuple(args.front_dte),
+        gap=tuple(args.gap),
         strike=args.strike,
         strike_range=args.strike_range,
         min_volume=args.min_volume,

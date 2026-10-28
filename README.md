@@ -9,7 +9,7 @@ fetching and from any UI.
 
 ```
 uv run calendar-iv-crush AAPL    # pre-earnings calendar spread IV crush screen
-uv run forward-factor AAPL       # rank calendar pairs near 30/60 DTE by forward factor
+uv run forward-factor AAPL       # rank calendar pairs (front 7-60 DTE, back 14-120 days later) by forward factor
 uv run forward-factor --bulk ff.txt  # rank a watchlist's tickers by passing trades
 ```
 
